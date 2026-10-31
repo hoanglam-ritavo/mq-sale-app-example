@@ -160,7 +160,7 @@ describe('Swagger documentation contract', () => {
         assertResponse(route, 202, res.body);
         const sent = publish.mock.calls.at(-1)![0].message;
         expect(sent).toMatchObject({
-          schemaVersion: 2,
+          schemaVersion: 3,
           source: 'sale-app-example',
           type: 'notification.requested',
         });
@@ -168,7 +168,7 @@ describe('Swagger documentation contract', () => {
         expect(sent.data).toHaveProperty('summary', expect.any(String));
         expect(sent.data).toHaveProperty('scenario', 'sale.' + route);
       }
-      expect(publish).toHaveBeenCalledTimes(4);
+      expect(publish).toHaveBeenCalledTimes(5);
     },
   );
   it('matches documented errors including parser and transport failures', async () => {
