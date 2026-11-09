@@ -66,7 +66,7 @@ export function createApp(
   );
   app.use(express.json({ limit: '1mb' }));
   app.use('/health', createHealthRouter());
-  app.use('/api/v1', createApiRouter(client, store));
+  app.use('/api/v1', createApiRouter(client, store, logger));
   app.use(createDocumentationRouter());
   app.use(notFound);
   app.use(createErrorHandler(logger));

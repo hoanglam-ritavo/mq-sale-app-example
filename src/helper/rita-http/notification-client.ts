@@ -10,16 +10,40 @@ export interface NotificationClient {
   send(input: NotificationRequest): Promise<void>;
   stop(): Promise<void>;
 }
+export const notificationFailureReasons = [
+  'TIMEOUT',
+  'TRANSPORT_ERROR',
+  'UPSTREAM_REDIRECT',
+  'UPSTREAM_HTTP_STATUS',
+  'RESPONSE_READ_ERROR',
+  'RESPONSE_TOO_LARGE',
+  'INVALID_RESPONSE_JSON',
+  'INVALID_RESPONSE_CONTRACT',
+  'UNEXPECTED_CLIENT_ERROR',
+] as const;
+export type NotificationFailureReason =
+  (typeof notificationFailureReasons)[number];
 export class NotificationClientError extends AppError {
-  constructor(status: number, code: string, message: string) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    public readonly reason?: NotificationFailureReason,
+    public readonly upstreamStatus?: number,
+  ) {
     super(status, code, message);
   }
 }
-const unknown = () =>
+export const unknownNotificationOutcome = (
+  reason: NotificationFailureReason,
+  upstreamStatus?: number,
+) =>
   new NotificationClientError(
-    502,
+    reason === 'TIMEOUT' ? 504 : 502,
     'RITA_OUTCOME_UNKNOWN',
     'Acceptance is unknown; retry the same identity and content.',
+    reason,
+    upstreamStatus,
   );
 export function notificationEndpoint(base: string): string {
   const url = new URL(base);
@@ -33,28 +57,44 @@ export function createNotificationClient(
 ): NotificationClient {
   const operations = new Set<Promise<void>>();
   let stopping = false;
-  async function dispatch(input: NotificationRequest, signal: AbortSignal) {
-    const response = await transport(
-      notificationEndpoint(config.rita.apiBaseUrl!),
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': config.rita.apiKey!,
+  async function dispatch(
+    input: NotificationRequest,
+    signal: AbortSignal,
+    received: (status: number) => void,
+  ) {
+    let response: Response;
+    try {
+      response = await transport(
+        notificationEndpoint(config.rita.apiBaseUrl!),
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': config.rita.apiKey!,
+          },
+          body: JSON.stringify(input),
+          redirect: 'manual',
+          signal,
         },
-        body: JSON.stringify(input),
-        redirect: 'manual',
-        signal,
-      },
-    );
+      );
+    } catch {
+      throw unknownNotificationOutcome('TRANSPORT_ERROR');
+    }
+    received(response.status);
     if (response.status !== 200) {
-      await response.body?.cancel();
+      try {
+        await response.body?.cancel();
+      } catch {
+        /* Preserve HTTP outcome. */
+      }
       const status = response.status;
       if (status === 401)
         throw new NotificationClientError(
           502,
           'RITA_CREDENTIAL_REJECTED',
           'Rita integration credentials are not eligible.',
+          undefined,
+          status,
         );
       if ([400, 409, 413, 503].includes(status))
         throw new NotificationClientError(
@@ -65,11 +105,23 @@ export function createNotificationClient(
             : status === 503
               ? 'Rita storage is unavailable; retry the same identity and content.'
               : 'Rita rejected the notification.',
+          undefined,
+          status,
         );
-      throw unknown();
+      throw unknownNotificationOutcome(
+        status >= 300 && status < 400
+          ? 'UPSTREAM_REDIRECT'
+          : 'UPSTREAM_HTTP_STATUS',
+        status,
+      );
     }
-    const reader = response.body?.getReader();
-    if (!reader) throw unknown();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      reader = response.body?.getReader();
+    } catch {
+      throw unknownNotificationOutcome('RESPONSE_READ_ERROR', 200);
+    }
+    if (!reader) throw unknownNotificationOutcome('INVALID_RESPONSE_JSON', 200);
     const chunks: Uint8Array[] = [];
     let size = 0;
     try {
@@ -77,17 +129,25 @@ export function createNotificationClient(
         const { value, done } = await reader.read();
         if (done) break;
         size += value.length;
-        if (size > 16384) throw unknown();
+        if (size > 16384)
+          throw unknownNotificationOutcome('RESPONSE_TOO_LARGE', 200);
         chunks.push(value);
       }
+    } catch (error) {
+      if (error instanceof NotificationClientError) throw error;
+      throw unknownNotificationOutcome('RESPONSE_READ_ERROR', 200);
     } finally {
-      await reader.cancel().catch(() => undefined);
+      try {
+        await reader.cancel();
+      } catch {
+        /* Preserve the original outcome. */
+      }
     }
     let data: unknown;
     try {
       data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     } catch {
-      throw unknown();
+      throw unknownNotificationOutcome('INVALID_RESPONSE_JSON', 200);
     }
     if (
       !data ||
@@ -97,7 +157,7 @@ export function createNotificationClient(
       !('status' in data) ||
       data.status !== 'accepted'
     )
-      throw unknown();
+      throw unknownNotificationOutcome('INVALID_RESPONSE_CONTRACT', 200);
   }
   return {
     async send(input) {
@@ -115,12 +175,16 @@ export function createNotificationClient(
         );
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const work = dispatch(input, controller.signal).catch(
-        (error: unknown) => {
-          if (error instanceof NotificationClientError) throw error;
-          throw unknown();
-        },
-      );
+      let upstreamStatus: number | undefined;
+      const work = dispatch(input, controller.signal, (status) => {
+        upstreamStatus = status;
+      }).catch((error: unknown) => {
+        if (error instanceof NotificationClientError) throw error;
+        throw unknownNotificationOutcome(
+          'UNEXPECTED_CLIENT_ERROR',
+          upstreamStatus,
+        );
+      });
       operations.add(work);
       void work.finally(() => operations.delete(work)).catch(() => undefined);
       try {
@@ -128,14 +192,8 @@ export function createNotificationClient(
           work,
           new Promise<never>((_resolve, reject) => {
             timer = setTimeout(() => {
+              reject(unknownNotificationOutcome('TIMEOUT', upstreamStatus));
               controller.abort();
-              reject(
-                new NotificationClientError(
-                  504,
-                  'RITA_OUTCOME_UNKNOWN',
-                  'Acceptance is unknown; retry the same identity and content.',
-                ),
-              );
             }, timeoutMs);
           }),
         ]);

@@ -1,3 +1,6 @@
+import { createLogger } from '../src/shared/logger.js';
+import { createNotificationClient } from '../src/helper/rita-http/notification-client.js';
+import { openApiDocument } from '../src/modules/documentation/index.js';
 import request from 'supertest';
 import { randomUUID } from 'node:crypto';
 import { describe, it, expect, vi } from 'vitest';
@@ -235,4 +238,133 @@ describe('Notification HTTP demo', () => {
       .expect(200);
     expect(f.send.mock.calls[0]![0].data).toMatchObject(context);
   });
+});
+
+describe('Notification failure diagnostics HTTP and OpenAPI', () => {
+  it.each(routes)('reports safe upstream diagnostics for %s', async (route) => {
+    const logger = createLogger(config),
+      warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const transport = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(
+        new Response('private-upstream-body', { status: 404 }),
+      );
+    const client = createNotificationClient(config, transport);
+    const body = input();
+    const result = await request(createApp(config, logger, client))
+      .post(base + route)
+      .auth(token, { type: 'bearer' })
+      .send(body)
+      .expect(502);
+    expect(result.body).toEqual({
+      messageId: body.messageId,
+      error: {
+        code: 'RITA_OUTCOME_UNKNOWN',
+        message: 'Acceptance is unknown; retry the same identity and content.',
+        reason: 'UPSTREAM_HTTP_STATUS',
+        upstreamStatus: 404,
+      },
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toEqual({
+      event: 'notification_send_failed',
+      messageId: body.messageId,
+      scenario: 'sale.' + route,
+      code: 'RITA_OUTCOME_UNKNOWN',
+      reason: 'UPSTREAM_HTTP_STATUS',
+      upstreamStatus: 404,
+      status: 502,
+      durationMs: expect.any(Number),
+    });
+    const serialized = JSON.stringify([result.body, warn.mock.calls]);
+    for (const secret of [
+      'private-upstream-body',
+      config.rita.apiKey!,
+      token,
+      body.data.title as string,
+      config.rita.apiBaseUrl!,
+    ])
+      expect(serialized).not.toContain(secret);
+    const document = JSON.parse(JSON.stringify(openApiDocument));
+    const media =
+      document.paths[base + route].post.responses['502'].content[
+        'application/json'
+      ];
+    expect(media.examples.notFound.value.error).toEqual(result.body.error);
+    expect(media.schema.properties.error.properties.reason.enum).toContain(
+      result.body.error.reason,
+    );
+    expect(
+      Object.keys(result.body.error).every(
+        (key) => key in media.schema.properties.error.properties,
+      ),
+    ).toBe(true);
+    expect(media.schema.properties.error.allOf[0].then.required).toContain(
+      'reason',
+    );
+    expect(
+      document.paths[base + route].post.responses['504'].content[
+        'application/json'
+      ].examples.timeout.value.error.reason,
+    ).toBe('TIMEOUT');
+    expect(media.examples.invalidResponse.value.error).toMatchObject({
+      reason: 'INVALID_RESPONSE_CONTRACT',
+      upstreamStatus: 200,
+    });
+    await client.stop();
+  });
+  it('logs only safe metadata for arbitrary client exceptions', async () => {
+    const logger = createLogger(config),
+      warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const client = {
+      send: vi
+        .fn()
+        .mockRejectedValue(new Error('private-error-' + config.rita.apiKey)),
+      stop: async () => undefined,
+    };
+    const result = await request(createApp(config, logger, client))
+      .post(base + routes[0])
+      .auth(token, { type: 'bearer' })
+      .send(input())
+      .expect(502);
+    expect(result.body.error.reason).toBe('UNEXPECTED_CLIENT_ERROR');
+    expect(result.body.error).not.toHaveProperty('upstreamStatus');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify([result.body, warn.mock.calls])).not.toContain(
+      'private-error',
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(config.rita.apiKey!);
+  });
+});
+
+describe('Published Swagger requests through HTTP', () => {
+  const document = JSON.parse(JSON.stringify(openApiDocument));
+  for (const route of routes) {
+    const examples =
+      document.paths[base + route].post.requestBody.content['application/json']
+        .examples;
+    for (const name of ['full', 'minimal', 'message']) {
+      it(
+        route + ' forwards ' + name + ' without dropping caller fields',
+        async () => {
+          const f = fixture();
+          const body = structuredClone(examples[name].value);
+          await request(f.app)
+            .post(base + route)
+            .auth(token, { type: 'bearer' })
+            .send(body)
+            .expect(200);
+          expect(f.send).toHaveBeenCalledExactlyOnceWith({
+            ...body,
+            data: {
+              ...body.data,
+              scenario: 'sale.' + route,
+              summary:
+                body.data.summary ?? templates[route as keyof typeof templates],
+            },
+          });
+        },
+      );
+    }
+  }
 });

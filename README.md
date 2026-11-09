@@ -72,22 +72,60 @@ Các API demo yêu cầu Authorization: Bearer <DEMO_API_TOKEN> trước JSON va
 
 ```json
 {
-  "messageId": "11111111-1111-4111-8111-111111111111",
-  "occurredAt": "2026-11-07T00:00:00Z",
+  "messageId": "a0000000-0000-4000-8000-000000000001",
+  "occurredAt": "2026-11-09T03:00:00Z",
+  "correlationId": "sale-demo-order-created",
   "data": {
-    "actor": null,
-    "recipientUserIds": ["22222222-2222-4222-8222-222222222222"],
-    "title": "Fictional notification",
-    "custom_badge": null
+    "actor": "11111111-1111-4111-8111-111111111111",
+    "recipientUserIds": [
+      "22222222-2222-4222-8222-222222222222"
+    ],
+    "title": "Đơn hàng mới (minh họa)",
+    "summary": "Đơn hàng mới: dữ liệu hư cấu để thử tích hợp.",
+    "type": "SYSTEM",
+    "priority": "MEDIUM",
+    "custom_badge": {
+      "label": "Đơn hàng mới",
+      "status": "SUCCESS"
+    }
   }
 }
 ```
+
+
+Swagger cung cấp ba mẫu cho mỗi endpoint: **Đầy đủ theo nghiệp vụ** (mặc định trong bộ chọn), **Dùng giá trị mặc định**, **Có ngữ cảnh hội thoại**. Mẫu đầy đủ ở trên dành cho order-created; giá trị type/priority/badge chỉ minh họa, không thay đổi default của route. Mẫu tối thiểu bỏ summary/type/priority/correlationId, actor và custom_badge là null: route thêm summary, Rita ID chuẩn hóa type=SYSTEM và priority=MEDIUM. MESSAGE cần cả group/message, scenario vẫn thuộc route.
+
+Type phân loại notification; priority biểu thị mức ưu tiên trình bày, không cam kết thứ tự giao nhận. Badge là nhãn nghiệp vụ: custom_badge.label lưu vào cột custom_badge, custom_badge.status lưu vào custom_badge_status; null không hiển thị badge. Enum so khớp chính xác, không trim/uppercase. Thiếu/null/chuỗi không hỗ trợ của type/priority thành SYSTEM/MEDIUM; badge.status null/chuỗi không hỗ trợ thành DEFAULT (field status vẫn bắt buộc khi badge là object).
+
+Thay actor/recipient bằng UUID Rita ID hợp lệ. Sự kiện mới cần messageId mới; retry cùng sự kiện giữ identity/nội dung/integration. Chuyển mẫu với messageId đã accepted có thể gây409. Swagger Authorize dùng DEMO_API_TOKEN, không phải Rita API key; simulation:true vẫn có thể tạo notification thật, không phải dry-run.
 
 Xem [file request hư cấu](examples/notification.json). Caller bắt buộc cấp messageId/occurredAt ổn định; tạo UUID mới cho sự kiện mới, giữ nguyên mọi nội dung khi retry cùng sự kiện. Giới hạn1–100 recipient UUID không trùng; giữ actor UUID/null, title, summary, badge và enum normalization tương ứng backend. MESSAGE bắt buộc group/message; loại khác cấm context. birthdayOccurrence bị cấm. Không gửi project_id, source, scenario, envelope type/schemaVersion; Project được Rita ID suy ra từ API key riêng của app.
 
 App gửi đúng wrapper qua POST /api-expose/notifications với X-API-Key phía server. Timeout10 giây, không redirect/retry tự động, không queue hoặc buffer retry. Chỉ backend200 với đúng messageId và status accepted mới trả200 {messageId,status:accepted,simulation:true}. Accepted là transaction Rita ID đã commit, có thể bị preferences ngăn tạo inbox; không phải người nhận đã đọc hay hoàn tất nghiệp vụ.
 
 Backend400/409/413/503 được ánh xạ bằng mã lỗi kiểm soát. Upstream401 thành502 RITA_CREDENTIAL_REJECTED để phân biệt Bearer token demo sai. Timeout504; network, redirect hoặc success response sai thành502 RITA_OUTCOME_UNKNOWN. Khi chưa chắc chắn, retry thủ công cùng identity/nội dung. Không có outbox bền vững ở example; caller chịu trách nhiệm lưu request cần retry. Không tự gửi lại hoặc đổi key/integration để né collision vì dedup ở Rita ID có namespace theo integration.
+
+## Chẩn đoán lỗi notification
+
+Cả ba route giữ nguyên HTTP status, error.code và error.message. RITA_OUTCOME_UNKNOWN thêm error.reason; error.upstreamStatus có mặt khi đã nhận HTTP response (kể cả các mã Rita được ánh xạ riêng). Caller cần chấp nhận các trường bổ sung. Reason mô tả lỗi kỹ thuật, không chứng minh backend chưa lưu notification.
+
+| Reason                    | Ý nghĩa / kiểm tra                                                                                               |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| TIMEOUT                   | Quá10 giây khi fetch hoặc đọc body; HTTP504. Kiểm tra backend/proxy trước khi retry.                             |
+| TRANSPORT_ERROR           | Fetch thất bại trước khi nhận response; HTTP502. Kiểm tra kết nối/DNS/TLS, không suy ra request chưa đến server. |
+| UPSTREAM_REDIRECT         | Nhận3xx; không follow redirect. Kiểm tra URL/proxy.                                                              |
+| UPSTREAM_HTTP_STATUS      | Status ngoài200 và các mapping riêng; xem upstreamStatus, ví dụ404/500.                                          |
+| RESPONSE_READ_ERROR       | Không đọc được response body.                                                                                    |
+| RESPONSE_TOO_LARGE        | Response vượt16 KiB.                                                                                             |
+| INVALID_RESPONSE_JSON     | Response rỗng hoặc JSON không hợp lệ.                                                                            |
+| INVALID_RESPONSE_CONTRACT | JSON sai kiểu/thiếu trường, messageId không khớp hoặc status khác accepted.                                      |
+| UNEXPECTED_CLIENT_ERROR   | Lỗi chưa phân loại tại client/router.                                                                            |
+
+Các reason ngoài TIMEOUT trả HTTP502. Ví dụ upstream404 trả error chứa code=RITA_OUTCOME_UNKNOWN, reason=UPSTREAM_HTTP_STATUS và upstreamStatus=404. Swagger có ví dụ timeout,404 và response sai contract. Khi timeout sau khi nhận headers, upstreamStatus vẫn được giữ.
+
+Base URL giữ nguyên path rồi nối /api-expose/notifications: https://id.example.test/api/ thành https://id.example.test/api/api-expose/notifications. Không đặt sẵn /api-expose trong base nếu dẫn đến đường dẫn lặp; đối chiếu prefix thực tế của backend. Sau khi xử lý nguyên nhân, retry thủ công nguyên request với cùng messageId, occurredAt, nội dung và integration; không đổi UUID để né lỗi.
+
+Mỗi lần gửi thất bại ghi một log warn notification_send_failed gồm messageId, scenario cố định, code, reason khi có, status trả về, upstreamStatus khi có và durationMs. LOG_LEVEL vẫn lọc log; access log giữ riêng. Không ghi notification payload, raw exception/response, headers, credentials hoặc URL cấu hình. Dùng messageId và thời điểm để đối chiếu backend/proxy; chưa có API tra cứu receipt trong example.
 
 ## Setup hai chiều với Rita ID
 
@@ -122,6 +160,24 @@ npm run docs:check
 Tests dùng fixtures hư cấu, Supertest và HTTP client inject; không dotenv, personal JSON hoặc dịch vụ dùng chung. Golden signature có expected value tạo bởi signer backend với key hư cấu; tests không import runtime từ sibling. Không tuyên bố mocks chứng minh HTTPS public/TLS, DB, restart durability hoặc delivery thật.
 
 ## Current verification status
+
+### Swagger notification examples — 2026-11-09
+
+Verified against `358c6eb` plus this documentation/example/test working tree and the preserved pre-existing Sale diagnostics changes. Every notification endpoint now offers full/minimal/message examples, full selected first. Full payloads explicitly show type/priority/badge; these are illustrative choices, not runtime defaults. The existing generated schema, auth, fallback, templates and error contracts are retained.
+
+- PASS: 68 tests across the focused documentation and notification HTTP suites; 0 failed/skipped. All published payloads validate and pass through the real HTTP router with an injected client double, preserving caller fields and adding only route scenario/summary as appropriate. Initial sandbox Vitest attempts failed with spawn EPERM; permitted subprocess runs passed.
+- PASS: typecheck, read-only ESLint, TypeScript build compilation and targeted Prettier checks for changed TypeScript/JSON. README format check still reports differences; the committed HEAD README also fails that check. Unrelated Markdown formatting is preserved.
+- PASS: local Chromium Swagger UI for every notification endpoint in this repo, within a five-endpoint Sale/Task check. All three options are available, full is selected initially, and every option matches the request editor payload. POST and external network access were blocked; no Execute request was sent. No application .env or real credentials were used.
+- PASS: docs checker covers 3 Markdown files, 28 links, 9 routes and 3 JSON examples. Mock HTTP/browser evidence does not prove live Rita persistence, delivery or database guarantees. No backend/portal/runtime policy change or migration is included.
+
+
+### Notification failure diagnostics — 2026-11-09
+
+Revision 358c6eb cộng working tree: thêm reason/upstreamStatus, log metadata và Swagger cho ba notification routes; giữ code/message/status cũ, timeout10s, không redirect/retry. Chỉ sửa sale-app-example; không sửa .env, dependencies hoặc sibling projects.
+
+- PASS: focused notification client/HTTP/documentation **84 tests /3 files**; full Vitest **187 tests /8 files,0 failed,0 skipped**. Bao phủ phân loại lỗi, upstream status, cleanup rejection, timeout/abort khi fetch/đọc body, shutdown draining, giới hạn16 KiB, contract và log không chứa secrets giả.
+- PASS: typecheck, ESLint read-only, format:check, build, docs:check (3 Markdown files,28 links,9 routes,3 JSON examples) và git diff --check. Lần Vitest sandbox đầu không khởi chạy vì spawn EPERM; lượt được cấp quyền đã chạy. Fixture giới hạn16 KiB ban đầu sinh hai UUID khác nhau, đã sửa trước các lượt pass.
+- Giới hạn: fixtures hư cấu, injected fetch và Express/Supertest; không gọi backend/HTTPS/DB thực tế, không đọc cấu hình cá nhân. Không chứng minh persistence, TLS hoặc nguyên nhân lỗi của môi trường đang chạy. Phần kết quả này được kiểm docs/format/diff riêng sau khi cập nhật.
 
 ### Profile RAM read API — 2026-11-09
 

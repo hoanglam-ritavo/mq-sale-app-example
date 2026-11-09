@@ -41,6 +41,7 @@ describe('Rita HTTP client', () => {
     [413, 413],
     [503, 503],
     [302, 502],
+    [404, 502],
     [500, 502],
   ])(
     'maps upstream%s to%s without exposing raw errors',
@@ -51,6 +52,13 @@ describe('Rita HTTP client', () => {
       const client = createNotificationClient(config, transport);
       await expect(client.send(input())).rejects.toMatchObject({
         status: expected,
+        upstreamStatus: status,
+        ...([302, 404, 500].includes(status)
+          ? {
+              reason:
+                status === 302 ? 'UPSTREAM_REDIRECT' : 'UPSTREAM_HTTP_STATUS',
+            }
+          : {}),
       });
       expect(transport).toHaveBeenCalledTimes(1);
       try {
@@ -81,6 +89,13 @@ describe('Rita HTTP client', () => {
       await expect(client.send(body)).rejects.toMatchObject({
         status: 502,
         code: 'RITA_OUTCOME_UNKNOWN',
+        reason:
+          kind === 'large'
+            ? 'RESPONSE_TOO_LARGE'
+            : ['malformed', 'empty'].includes(kind)
+              ? 'INVALID_RESPONSE_JSON'
+              : 'INVALID_RESPONSE_CONTRACT',
+        upstreamStatus: 200,
       });
       await client.stop();
     },
@@ -93,6 +108,8 @@ describe('Rita HTTP client', () => {
     await expect(client.send(input())).rejects.toMatchObject({
       status: 502,
       code: 'RITA_OUTCOME_UNKNOWN',
+      reason: 'TRANSPORT_ERROR',
+      upstreamStatus: undefined,
     });
     await client.stop();
     expect(transport).toHaveBeenCalledTimes(1);
@@ -106,6 +123,8 @@ describe('Rita HTTP client', () => {
     const work = expect(client.send(body)).rejects.toMatchObject({
       status: 504,
       code: 'RITA_OUTCOME_UNKNOWN',
+      reason: 'TIMEOUT',
+      upstreamStatus: undefined,
     });
     await vi.advanceTimersByTimeAsync(10000);
     await work;
@@ -139,6 +158,104 @@ describe('Rita HTTP client', () => {
       code: 'RITA_NOT_CONFIGURED',
     });
     expect(transport).not.toHaveBeenCalled();
+    await client.stop();
+  });
+});
+
+describe('Notification diagnostics edge cases', () => {
+  it.each([302, 404, 401, 409, 503])(
+    'retains upstream %s when cancellation rejects',
+    async (status) => {
+      const response = new Response(
+        new ReadableStream({
+          cancel() {
+            throw new Error('private cleanup');
+          },
+        }),
+        { status },
+      );
+      const client = createNotificationClient(
+        config,
+        vi.fn<typeof fetch>().mockResolvedValue(response),
+      );
+      await expect(client.send(input())).rejects.toMatchObject({
+        upstreamStatus: status,
+        code:
+          status === 401
+            ? 'RITA_CREDENTIAL_REJECTED'
+            : [409, 503].includes(status)
+              ? 'RITA_HTTP_' + status
+              : 'RITA_OUTCOME_UNKNOWN',
+      });
+      await client.stop();
+    },
+  );
+  it('classifies stream read failure', async () => {
+    const response = new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.error(new Error('private read'));
+        },
+      }),
+    );
+    const client = createNotificationClient(
+      config,
+      vi.fn<typeof fetch>().mockResolvedValue(response),
+    );
+    await expect(client.send(input())).rejects.toMatchObject({
+      reason: 'RESPONSE_READ_ERROR',
+      upstreamStatus: 200,
+    });
+    await client.stop();
+  });
+  it.each(['fetch', 'body'])(
+    'timeout wins abort rejection during %s',
+    async (phase) => {
+      vi.useFakeTimers();
+      const transport = vi
+        .fn<typeof fetch>()
+        .mockImplementation((_url, options) => {
+          if (phase === 'fetch')
+            return new Promise((_resolve, reject) =>
+              options!.signal!.addEventListener('abort', () =>
+                reject(new Error('private abort')),
+              ),
+            );
+          return Promise.resolve(
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  options!.signal!.addEventListener('abort', () =>
+                    controller.error(new Error('private abort')),
+                  );
+                },
+              }),
+            ),
+          );
+        });
+      const client = createNotificationClient(config, transport);
+      const work = expect(client.send(input())).rejects.toMatchObject({
+        status: 504,
+        reason: 'TIMEOUT',
+        upstreamStatus: phase === 'body' ? 200 : undefined,
+      });
+      await vi.advanceTimersByTimeAsync(10000);
+      await work;
+      await client.stop();
+      expect(transport).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('accepts exactly 16 KiB', async () => {
+    const notification = input();
+    const body = JSON.stringify({
+      messageId: notification.messageId,
+      status: 'accepted',
+    }).padEnd(16384, ' ');
+    const client = createNotificationClient(
+      config,
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(body)),
+    );
+    await expect(client.send(notification)).resolves.toBeUndefined();
     await client.stop();
   });
 });

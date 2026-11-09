@@ -2,7 +2,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { uuid, utcTimestamp } from '../../shared/contracts.js';
 import { AppError } from '../../shared/errors/app-error.js';
-import type { NotificationClient } from '../../helper/rita-http/notification-client.js';
+import type { Logger } from 'pino';
+import {
+  NotificationClientError,
+  unknownNotificationOutcome,
+  type NotificationClient,
+} from '../../helper/rita-http/notification-client.js';
 const nonblank = (max: number) =>
   z
     .string()
@@ -117,7 +122,10 @@ export const templates = {
   'customer-support-requested': 'Khách hàng Nguyễn Thị A yêu cầu hỗ trợ',
 };
 
-export function createNotificationExampleRouter(client: NotificationClient) {
+export function createNotificationExampleRouter(
+  client: NotificationClient,
+  logger: Logger,
+) {
   const router = Router();
   for (const [route, summary] of Object.entries(templates))
     router.post('/' + route, async (req, res) => {
@@ -137,6 +145,7 @@ export function createNotificationExampleRouter(client: NotificationClient) {
           summary: parsed.data.data.summary ?? summary,
         },
       };
+      const started = performance.now();
       try {
         await client.send(input);
         res.status(200).json({
@@ -148,14 +157,36 @@ export function createNotificationExampleRouter(client: NotificationClient) {
         const e =
           error instanceof AppError
             ? error
-            : new AppError(
-                502,
-                'RITA_OUTCOME_UNKNOWN',
-                'Acceptance is unknown; retry the same identity and content.',
-              );
+            : unknownNotificationOutcome('UNEXPECTED_CLIENT_ERROR');
+        const metadata = {
+          ...(e.code === 'RITA_OUTCOME_UNKNOWN'
+            ? {
+                reason:
+                  e instanceof NotificationClientError && e.reason
+                    ? e.reason
+                    : 'UNEXPECTED_CLIENT_ERROR',
+              }
+            : {}),
+          ...(e instanceof NotificationClientError &&
+          e.upstreamStatus !== undefined
+            ? { upstreamStatus: e.upstreamStatus }
+            : {}),
+        };
+        logger.warn(
+          {
+            event: 'notification_send_failed',
+            messageId: input.messageId,
+            scenario: input.data.scenario,
+            code: e.code,
+            ...metadata,
+            status: e.status,
+            durationMs: Math.round(performance.now() - started),
+          },
+          'Notification send failed',
+        );
         res.status(e.status).json({
           messageId: input.messageId,
-          error: { code: e.code, message: e.message },
+          error: { code: e.code, message: e.message, ...metadata },
         });
       }
     });
