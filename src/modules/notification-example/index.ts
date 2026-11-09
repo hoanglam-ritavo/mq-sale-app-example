@@ -100,8 +100,16 @@ export const notificationData = z
     }
   });
 
-export const requestSchema=z.strictObject({messageId:uuid,occurredAt:utcTimestamp,correlationId:z.string().refine(v=>!!v.trim()).optional(),data:notificationData});
-export type NotificationExampleRequest=z.infer<typeof requestSchema>;
+export const requestSchema = z.strictObject({
+  messageId: uuid,
+  occurredAt: utcTimestamp,
+  correlationId: z
+    .string()
+    .refine((v) => !!v.trim())
+    .optional(),
+  data: notificationData,
+});
+export type NotificationExampleRequest = z.infer<typeof requestSchema>;
 export const templates = {
   'order-created': 'Đơn hàng demo đã được tạo',
   'stock-approval-requested':
@@ -109,12 +117,47 @@ export const templates = {
   'customer-support-requested': 'Khách hàng Nguyễn Thị A yêu cầu hỗ trợ',
 };
 
-
-export function createNotificationExampleRouter(client:NotificationClient){
- const router=Router();for(const [route,summary]of Object.entries(templates))router.post('/'+route,async(req,res)=>{
-  const parsed=requestSchema.safeParse(req.body);if(!parsed.success)throw new AppError(400,'INVALID_NOTIFICATION_REQUEST','Invalid notification example request.');
-  const input={...parsed.data,messageId:parsed.data.messageId.toLowerCase(),data:{...parsed.data.data,scenario:'sale.'+route,summary:parsed.data.data.summary??summary}};
-  try{await client.send(input);res.status(200).json({messageId:input.messageId,status:'accepted',simulation:true});}
-  catch(error:unknown){const e=error instanceof AppError?error:new AppError(502,'RITA_OUTCOME_UNKNOWN','Acceptance is unknown; retry the same identity and content.');res.status(e.status).json({messageId:input.messageId,error:{code:e.code,message:e.message}});}
- });return router;
+export function createNotificationExampleRouter(client: NotificationClient) {
+  const router = Router();
+  for (const [route, summary] of Object.entries(templates))
+    router.post('/' + route, async (req, res) => {
+      const parsed = requestSchema.safeParse(req.body);
+      if (!parsed.success)
+        throw new AppError(
+          400,
+          'INVALID_NOTIFICATION_REQUEST',
+          'Invalid notification example request.',
+        );
+      const input = {
+        ...parsed.data,
+        messageId: parsed.data.messageId.toLowerCase(),
+        data: {
+          ...parsed.data.data,
+          scenario: 'sale.' + route,
+          summary: parsed.data.data.summary ?? summary,
+        },
+      };
+      try {
+        await client.send(input);
+        res.status(200).json({
+          messageId: input.messageId,
+          status: 'accepted',
+          simulation: true,
+        });
+      } catch (error: unknown) {
+        const e =
+          error instanceof AppError
+            ? error
+            : new AppError(
+                502,
+                'RITA_OUTCOME_UNKNOWN',
+                'Acceptance is unknown; retry the same identity and content.',
+              );
+        res.status(e.status).json({
+          messageId: input.messageId,
+          error: { code: e.code, message: e.message },
+        });
+      }
+    });
+  return router;
 }
